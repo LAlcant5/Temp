@@ -1,0 +1,153 @@
+create_basetable <- function(forecast,forecast_minus1M, inventory, backorder, fie, 
+                             itemmaster, sales, openpo, quantity_ordered_shipped, 
+                             ideal_nonideal_mapping, week, year, brand_p4,rop, tm1, lotif, sales_weekly){
+  #rename forecast minus 1M to avoid merging conflicts
+  forecast_minus1M <- forecast_minus1M %>% rename(forecast_minus1M = revenue)
+
+  intermediate <- forecast %>% 
+    full_join(forecast_minus1M) %>% 
+    full_join(inventory) %>% 
+    full_join(backorder) %>% 
+    full_join(fie) %>% 
+    full_join(openpo) %>% 
+    full_join(sales) %>% 
+    full_join(quantity_ordered_shipped) %>% 
+    full_join(sales_weekly) %>% 
+    left_join_safely(rop) %>% 
+    left_join_safely(tm1) %>% 
+    mutate_if(is.numeric, ~replace(., is.na(.), 0)) %>% 
+    group_by(country, item_number) %>% 
+    summarise(across(c(where(is.numeric)), sum)) %>% 
+    ungroup() %>% 
+    left_join_safely(itemmaster) %>% 
+    mutate(missing_rop = if_else(is.na(rop), T, F)) %>% 
+    mutate(rop = if_else(is.na(rop), 0, rop)) %>% 
+    mutate(item_number_no_variant_no_sterile = trimws(remove_variant_suffix(item_number))) %>% 
+    mutate(item_number_no_variant_no_sterile = gsub("S$", "", item_number_no_variant_no_sterile)) %>% 
+    left_join_safely(brand_p4) %>% 
+    mutate(brand = tolower(trimws(brand))) %>% 
+    mutate(P4_sub_brand = tolower(trimws(P4_sub_brand))) %>% 
+    mutate(brand = if_else(is.na(brand) | brand == "", "Unknown",brand)) %>%
+    mutate(P4_sub_brand = if_else(is.na(P4_sub_brand) | P4_sub_brand == "" , "Unknown",P4_sub_brand)) %>% 
+    mutate(P3_description = if_else(is.na(P3_description) | P3_description == "" , "Unknown",P3_description)) %>% 
+    mutate(p_2_parent_description = if_else(is.na(p_2_parent_description) | p_2_parent_description == "" , "Unknown",as.character(p_2_parent_description))) %>% 
+    bind_brand_fidelity() %>% 
+    bind_gl_code_emea() %>% 
+    bind_brand_fie_emea() %>% 
+    mutate(brand = if_else(brand == "Unknown" & brand_fidelity != "Unknown", brand_fidelity, if_else(brand_fie_emea != "Unknown" & brand == "Unknown", brand_fie_emea, brand))) %>% 
+    mutate(major = case_when(grepl("Trauma", gl_code_emea) ~ "Synthes Trauma",
+                             grepl("CMF", gl_code_emea) ~ "Synthes CMF",
+                             grepl("Depuy Spine", gl_code_emea) ~ "Depuy Spine",
+                             grepl("Synthes Spine", gl_code_emea) ~ "Synthes Spine",
+                             T ~ major)) %>% 
+    mutate(BU = if_else(major %in% c("Knees", "Hips", "Schoulders"), "Joints", BU)) %>% 
+    mutate(BU = case_when(grepl("Trauma", gl_code_emea) ~ "TECA",
+                             grepl("CMF", gl_code_emea) ~ "TECA",
+                             grepl("Spine", gl_code_emea) ~ "Spine",
+                             grepl("Joint", gl_code_emea) ~ "Joints",
+                             T ~ BU)) %>%     
+    left_join_safely(ideal_nonideal_mapping) %>% 
+    mutate(ideal_or_nonideal = if_else(is.na(ideal_or_nonideal), "non-ideal",ideal_or_nonideal)) 
+  #write_rds_compressed(intermediate, paste0("intermediates/", year, "_basetable_full_data_", week, ".rds")) #write intermediate basetable
+  output <- intermediate %>% 
+    transmute(country, BU, major,brand, P4_sub_brand,P3_description, item_number, 
+              forecast_minus1M_units =  forecast_minus1M, sales_1M_units, sales_12M_units, forecast_1M_units = revenue, 
+              ROP = rop, open_order_units, hub_units,
+              hub_entitlement_units  = ceiling(pmax(sales_1M_units, rop, forecast_1M_units) * if_else(ideal_or_nonideal == "ideal", 0.75, 0.375)), 
+              field_units =  loaner_units + consigned_units, loaner_units, consigned_units, 
+              field_entitlement_units = case_when(country == "DE" ~ (fie_optimal_level * 1.25) + (0.90 *loaner_units),
+                                                  country =="UK" ~ (fie_optimal_level * 1.25) + (0.89 *loaner_units),
+                                                  country =="CH" ~ (fie_optimal_level * 1.25) + (0.79 *loaner_units),
+                                                  country =="AT" ~ (fie_optimal_level * 1.25) + (0.90 *loaner_units),
+                                                  country =="BE" ~ (fie_optimal_level * 1.25) + (0.89 *loaner_units),
+                                                  country =="FR" ~ (fie_optimal_level * 1.25) + (0.89 *loaner_units),
+                                                  country =="NL" ~ (fie_optimal_level * 1.25) + (0.82 *loaner_units),
+                                                  country =="PL" ~ (fie_optimal_level * 1.25) + (0.92 *loaner_units),
+                                                  country =="ES-PT" ~ (fie_optimal_level * 1.25) + (0.925 *loaner_units),
+                                                  country =="ZA" ~ (fie_optimal_level * 1.25) + (0.89 *loaner_units),
+                                                  country =="NO" ~ (fie_optimal_level * 1.25) + (0.9 *loaner_units),
+                                                  country =="IT" ~ (fie_optimal_level * 1.25) + (0.84 *loaner_units),
+                                                  T ~ (fie_optimal_level * 1.25) + (0.87 *loaner_units)),
+              edc_ordered_by_market_units, edc_shipped_to_market_units, hub_ordered_by_customer_units, hub_shipped_to_customer_units,
+              backorder_quantity_units = backorder_quantity, ideal_or_nonideal, missing_rop,   p_2_parent_description, rop_flat_units = rop_flat, 
+            rop_flat_ideal_correction_units  = rop_flat * if_else(ideal_or_nonideal == "ideal", 0.75, 0.375),
+            weekly_sales)  %>%  #add 25 % to FIE and take 95% for loaner 
+    #pro rate variables
+    mutate(total_inventory_variant = field_units + hub_units) %>%
+    mutate(item_number_no_variant = trimws(remove_variant_suffix(item_number))) %>% 
+    mutate(weekly_sales = as.numeric(weekly_sales)) %>% 
+    group_by(country, item_number_no_variant) %>% 
+    mutate(total_inventory_item = sum(total_inventory_variant, na.rm = T),
+           total_field_entitlement_to_prorate = sum(field_entitlement_units, na.rm = T), #1
+           total_rop_to_prorate = sum(ROP, na.rm = T),
+           total_rop_units_to_prorate = sum(rop_flat_units, na.rm = T), #2
+           edc_ordered_by_market_units_to_prorate = sum(edc_ordered_by_market_units, na.rm = T), #3
+           edc_shipped_to_market_units_to_prorate = sum(edc_shipped_to_market_units, na.rm = T),
+           hub_ordered_by_customer_units_to_prorate = sum(hub_ordered_by_customer_units, na.rm = T),
+           hub_shipped_to_customer_units_to_prorate = sum(hub_shipped_to_customer_units, na.rm = T),
+           weekly_sales_to_prorate = sum(weekly_sales, na.rm = T),
+           forecast_1M_units_to_prorate = sum(forecast_1M_units, na.rm = T)
+           ) %>%  # 6
+    ungroup() %>% 
+    mutate(pro_rate_factor = total_inventory_variant/total_inventory_item) %>% 
+    mutate(ROP = ceiling(total_rop_to_prorate * pro_rate_factor),
+           field_entitlement_units = ceiling(total_field_entitlement_to_prorate * pro_rate_factor),
+           rop_flat_units = ceiling(total_rop_units_to_prorate * pro_rate_factor),
+           edc_ordered_by_market_units = ceiling(edc_ordered_by_market_units_to_prorate * pro_rate_factor),
+           edc_shipped_to_market_units = ceiling(edc_shipped_to_market_units_to_prorate * pro_rate_factor),
+           hub_ordered_by_customer_units = ceiling(hub_ordered_by_customer_units_to_prorate * pro_rate_factor),
+           hub_shipped_to_customer_units = ceiling(hub_shipped_to_customer_units_to_prorate * pro_rate_factor),
+           weekly_sales = ceiling(weekly_sales_to_prorate * pro_rate_factor),
+           forecast_1M_units = ceiling(forecast_1M_units_to_prorate * pro_rate_factor)) %>% 
+    select(-total_field_entitlement_to_prorate, -edc_ordered_by_market_units_to_prorate, 
+           -edc_shipped_to_market_units_to_prorate, -hub_ordered_by_customer_units_to_prorate,
+           -hub_shipped_to_customer_units_to_prorate, 
+           -hub_shipped_to_customer_units_to_prorate, 
+           -pro_rate_factor, -total_inventory_item, -total_inventory_variant,
+           -total_rop_to_prorate, -total_rop_units_to_prorate,
+           -weekly_sales_to_prorate, -forecast_1M_units_to_prorate) %>% 
+    mutate(under_field_entitlement = if_else(field_units >= field_entitlement_units, 0,1)) %>% #number of items below entitlement
+    mutate(under_hub_entitlement = if_else(hub_units < hub_entitlement_units & !(country %in% direct_markets), 1,0)) %>% # number of units below hub ss
+    mutate(under_hub_entitlement_flat_ideal_nonideal = if_else(hub_units < rop_flat_ideal_correction_units & !(country %in% direct_markets) , 1,0)) %>% # number of units below hub ss
+    mutate(under_hub_entitlement_flat = if_else(hub_units < rop_flat_units & !(country %in% direct_markets) , 1,0)) %>% # number of units below hub ss
+    mutate(on_backorder = if_else(backorder_quantity_units > 0, 1,0)) %>% #number of units on BO
+    mutate(rop_flat_greater_than_zero = if_else(rop_flat_units > 0, 1,0)) %>% #number of units with rop >0
+    mutate(rop_flat_greater_than_zero_and_below_SS = if_else(rop_flat_units > 0 & hub_units < hub_entitlement_units & !(country %in% direct_markets), 1,0)) %>% #number of units with rop >0 & below entitlment
+    mutate(rop_flat_greater_than_zero_and_on_backorder = if_else(backorder_quantity_units > 0 & rop_flat_units > 0,  1,0)) %>% 
+    mutate(rop_greater_than_zero = if_else(ROP > 0, 1,0)) %>% #number of units with rop >0
+    mutate(rop_greater_than_zero_and_below_SS = if_else(ROP > 0 & hub_units < hub_entitlement_units & !(country %in% direct_markets), 1,0)) %>% #number of units with rop >0 & below entitlment
+    mutate(rop_greater_than_zero_and_on_backorder = if_else(backorder_quantity_units > 0 & ROP > 0,  1,0)) %>% 
+    mutate(under_field_entitlement_and_on_BO = if_else(backorder_quantity_units > 0 & field_units < field_entitlement_units,  1,0)) %>% #number of SKU below field entitlment and on backorder
+    bind_unit_cost_gmed_std_usd() %>% 
+    bind_unit_cost_glpii() %>% 
+      mutate(across(contains("units"), ~.*unit_cost_glpii, .names = "{col}_glpii")) %>%
+      rename_at(vars(contains("glpii")), .funs = list(~ str_remove(., "units_"))) %>% 
+      mutate(across(contains("units"), ~.*unit_cost_gmed_std_usd, .names = "{col}_std_cost")) %>%
+      rename_at(vars(contains("std_cost")), .funs = list(~ str_remove(., "units_"))) %>% 
+    filter(!brand %in% c("cement", "bone cement")) %>% 
+    mutate(Week = paste0(year, "/", week)) %>% 
+    mutate(Year = year) %>% 
+    mutate(hub_entitlement_units = if_else(country %in% direct_markets, 0, hub_entitlement_units)) %>% 
+    mutate(hub_entitlement_std_cost = if_else(country %in% direct_markets, 0, hub_entitlement_std_cost)) %>% 
+    mutate(hub_entitlement_glpii = if_else(country %in% direct_markets, 0, hub_entitlement_glpii)) %>% 
+    mutate(item_week = paste(item_number, week, year, sep = ":")) %>% 
+    mutate(minimum_units_ordered_shipped = if_else(!(country %in% direct_markets), pmin(hub_ordered_by_customer_units, hub_shipped_to_customer_units),pmin(edc_ordered_by_market_units, edc_shipped_to_market_units))) %>% 
+    mutate_if(is.numeric, ~replace(., is.na(.), 0)) %>% 
+    mutate_if(is.numeric, ~replace(., is.nan(.), 0)) %>% 
+    mutate(mts_mto = if_else(condition = rop_flat_units >0 & !(country %in% direct_markets), "MTS", "MTO")) %>% 
+    mutate(weekly_forecast = forecast_1M_units/financial_weeks_in_month)
+    
+  
+  base_with_LOTIF <- output %>% 
+    left_join_safely(lotif) %>% 
+    group_by(country, item_number_no_variant) %>% 
+    mutate(LOTIF = first(LOTIF)) %>%  # 6
+    ungroup() %>% 
+    mutate(LOTIF = if_else(is.na(LOTIF), "no L-OTIF", as.character(LOTIF)))%>% 
+    filter(!(hub_units == 0 & field_units == 0 & edc_ordered_by_market_units == 0 &
+               edc_shipped_to_market_units == 0 & hub_ordered_by_customer_units == 0 & hub_shipped_to_customer_units == 0 &
+               backorder_quantity_units == 0 & forecast_minus1M_units == 0 & forecast_1M_units == 0 & hub_entitlement_units == 0 & 
+               field_entitlement_units == 0))
+
+  return(base_with_LOTIF)
+}
